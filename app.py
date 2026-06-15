@@ -1,11 +1,12 @@
 """
 AI Driver Drowsiness Detection System
-Tornado shim at top fixes BaseAsyncIOLoop removal in tornado >=6.4.
-Two capture modes: WebRTC (local) and Snapshot/st.camera_input (cloud).
+- Live camera component (no click needed) as default mode
+- WebRTC mode for local/fast use
+- Tornado >=6.4 shim for streamlit-webrtc compatibility
 """
 from __future__ import annotations
 
-# ── Tornado >=6.4 compatibility shim ─────────────────────────────────────
+# ── Tornado >=6.4 compatibility shim ──────────────────────────────────────
 import tornado.platform.asyncio as _tpa
 if not hasattr(_tpa, "BaseAsyncIOLoop"):
     import asyncio as _asyncio
@@ -15,6 +16,8 @@ if not hasattr(_tpa, "BaseAsyncIOLoop"):
     _tpa.BaseAsyncIOLoop = _BaseAsyncIOLoopShim
 # ─────────────────────────────────────────────────────────────────────────
 
+import base64
+import io
 import json
 import logging
 import threading
@@ -31,8 +34,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from PIL import Image
 from streamlit_autorefresh import st_autorefresh
-from streamlit_webrtc import WebRtcMode, webrtc_streamer
+from streamlit_webrtc import VideoProcessorBase, WebRtcMode, webrtc_streamer
 
+from components.live_camera import live_camera_input
 from detectors.eye_detector import EyeDetector
 from detectors.headpose_detector import HeadPoseDetector
 from detectors.yawn_detector import YawnDetector
@@ -58,12 +62,15 @@ logger = logging.getLogger(__name__)
 
 st.set_page_config(
     page_title="AI Drowsiness Detection",
-    page_icon="car",
+    page_icon="🚗",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 
+# ---------------------------------------------------------------------------
+# MediaPipe (cached per session)
+# ---------------------------------------------------------------------------
 @st.cache_resource
 def load_face_mesh(det_conf: float, track_conf: float):
     return mp.solutions.face_mesh.FaceMesh(
@@ -74,6 +81,9 @@ def load_face_mesh(det_conf: float, track_conf: float):
     )
 
 
+# ---------------------------------------------------------------------------
+# Thread-safe result slot
+# ---------------------------------------------------------------------------
 class _ResultSlot:
     def __init__(self):
         self._lock = threading.Lock()
@@ -88,38 +98,39 @@ class _ResultSlot:
             return self._data
 
 
+# ---------------------------------------------------------------------------
+# Core frame processor (shared by all modes)
+# ---------------------------------------------------------------------------
 class FrameProcessor:
-    """Full detection pipeline for a single BGR frame."""
-
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
-        self.eye = EyeDetector(cfg.ear.threshold, cfg.ear.smoothing_alpha,
-                                cfg.ear.consec_frames)
+        self.eye  = EyeDetector(cfg.ear.threshold, cfg.ear.smoothing_alpha,
+                                 cfg.ear.consec_frames)
         self.yawn = YawnDetector(cfg.mar.threshold, cfg.mar.smoothing_alpha,
                                   cfg.mar.consec_frames)
         self.pose = HeadPoseDetector(cfg.head_pose.pitch_threshold,
                                      cfg.head_pose.yaw_threshold,
                                      cfg.head_pose.roll_threshold)
-        self.clf = DrowsinessClassifier(cfg.ear, cfg.mar,
-                                         cfg.head_pose, cfg.drowsiness)
+        self.clf  = DrowsinessClassifier(cfg.ear, cfg.mar,
+                                          cfg.head_pose, cfg.drowsiness)
         self.face_mesh = load_face_mesh(cfg.face_min_confidence,
                                          cfg.face_tracking_confidence)
         self._prev = time.time()
-        self.fps = 0.0
+        self.fps   = 0.0
 
     def process(self, bgr: np.ndarray) -> tuple:
         now = time.time()
-        dt = now - self._prev
-        self.fps = 1.0 / dt if dt > 0 else 30.0
+        dt  = now - self._prev
+        self.fps  = 1.0 / dt if dt > 0 else 30.0
         self._prev = now
 
         h, w = bgr.shape[:2]
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        res = self.face_mesh.process(rgb)
+        rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        res  = self.face_mesh.process(rgb)
 
         if res.multi_face_landmarks:
-            lm = res.multi_face_landmarks[0]
-            eye_r = self.eye.process(lm, (h, w))
+            lm     = res.multi_face_landmarks[0]
+            eye_r  = self.eye.process(lm, (h, w))
             yawn_r = self.yawn.process(lm, (h, w))
             pose_r = self.pose.process(lm, (h, w))
             dr: DrowsinessResult = self.clf.evaluate(eye_r, yawn_r, pose_r)
@@ -146,20 +157,25 @@ class FrameProcessor:
         else:
             annotated = bgr.copy()
             cv2.putText(annotated, "No Face Detected",
-                        (20, 40), cv2.FONT_HERSHEY_DUPLEX,
-                        0.9, (100, 100, 120), 2, cv2.LINE_AA)
+                        (20, 50), cv2.FONT_HERSHEY_DUPLEX,
+                        1.0, (80, 80, 120), 2, cv2.LINE_AA)
             data = dict(
                 face_detected=False, status="No Face", score=0.0,
-                confidence=0.0, ear=0.0, mar=0.0, pitch=0.0, yaw=0.0,
-                roll=0.0, is_closed=False, closure_secs=0.0,
-                is_yawning=False, blink_rate=0.0, blink_count=0,
-                yawn_count=0, color_hex="#888888",
-                fps=round(self.fps, 1), component_scores={}, ts=now,
+                confidence=0.0, ear=0.0, mar=0.0,
+                pitch=0.0, yaw=0.0, roll=0.0,
+                is_closed=False, closure_secs=0.0,
+                is_yawning=False, blink_rate=0.0,
+                blink_count=0, yawn_count=0,
+                color_hex="#888888", fps=round(self.fps, 1),
+                component_scores={}, ts=now,
             )
         return annotated, data
 
 
-class DrowsinessVideoProcessor:
+# ---------------------------------------------------------------------------
+# WebRTC video processor
+# ---------------------------------------------------------------------------
+class DrowsinessVideoProcessor(VideoProcessorBase):
     def __init__(self, cfg: AppConfig, slot: _ResultSlot):
         self.proc = FrameProcessor(cfg)
         self.slot = slot
@@ -171,28 +187,36 @@ class DrowsinessVideoProcessor:
         return av.VideoFrame.from_ndarray(annotated, format="bgr24")
 
 
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
 def init_state(cfg: AppConfig):
     defaults = {
-        "cfg": cfg,
-        "result_slot": _ResultSlot(),
-        "processor": None,
-        "metrics": MetricsTracker(cfg.history_size, cfg.log_csv_path,
-                                   cfg.ear.threshold),
-        "audio": AudioManager(),
+        "cfg":           cfg,
+        "result_slot":   _ResultSlot(),
+        "processor":     None,
+        "metrics":       MetricsTracker(cfg.history_size, cfg.log_csv_path,
+                                         cfg.ear.threshold),
+        "audio":         AudioManager(),
         "alarm_enabled": True,
-        "alarm_volume": 0.75,
-        "last_result": None,
-        "score_history": [], "ear_history": [],
-        "time_history": [], "status_log": [],
+        "alarm_volume":  0.75,
+        "last_result":   None,
+        "score_history": [],
+        "ear_history":   [],
+        "time_history":  [],
+        "status_log":    [],
         "session_start": time.time(),
-        "snap_frame_count": 0,
-        "capture_mode": "snapshot",
+        "capture_mode":  "live",      # "live" | "webrtc"
+        "last_frame_b64": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 
+# ---------------------------------------------------------------------------
+# Charts
+# ---------------------------------------------------------------------------
 def _chart_base():
     return dict(
         plot_bgcolor="rgba(0,0,0,0)",
@@ -210,7 +234,7 @@ def score_chart(t, s):
         fig.add_hline(y=y, line_dash="dot", line_color=col, opacity=.7,
                       annotation_text=lbl,
                       annotation_font_color=col, annotation_font_size=10)
-    fig.add_trace(go.Scatter(x=t, y=s, mode="lines", name="Score",
+    fig.add_trace(go.Scatter(x=t, y=s, mode="lines",
                               line=dict(color="#667eea", width=2),
                               fill="tozeroy",
                               fillcolor="rgba(102,126,234,.08)"))
@@ -251,8 +275,8 @@ def donut_chart(a, sl, d):
         hovertemplate="%{label}: %{value:.1f}%<extra></extra>",
     ))
     fig.update_layout(
-        height=170, plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
+        height=170,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Inter", size=11, color="#9090b0"),
         legend=dict(font=dict(size=10, color="#9090b0"),
                     bgcolor="rgba(0,0,0,0)", x=1.0, y=0.5),
@@ -264,13 +288,16 @@ def donut_chart(a, sl, d):
     return fig
 
 
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
 def render_sidebar(cfg: AppConfig) -> dict:
     s = {}
     with st.sidebar:
         st.markdown("""
 <div style="text-align:center;padding:8px 0 16px">
   <div style="font-size:2rem">&#x1F697;</div>
-  <div style="font-size:1rem;font-weight:800;
+  <div style="font-size:1.05rem;font-weight:800;
        background:linear-gradient(135deg,#667eea,#f093fb);
        -webkit-background-clip:text;-webkit-text-fill-color:transparent;
        background-clip:text">DrowseSafe AI</div>
@@ -281,34 +308,35 @@ def render_sidebar(cfg: AppConfig) -> dict:
         st.markdown("**Capture Mode**")
         mode = st.radio(
             "Mode",
-            ["Snapshot (Cloud)", "WebRTC (Local)"],
-            index=0, label_visibility="collapsed",
-            help="Snapshot works everywhere. WebRTC needs local network.",
+            ["Live Camera (Default)", "WebRTC (Local)"],
+            index=0,
+            label_visibility="collapsed",
+            help="Live Camera works on Streamlit Cloud. WebRTC needs local network.",
         )
-        s["capture_mode"] = "snapshot" if "Snapshot" in mode else "webrtc"
+        s["capture_mode"] = "live" if "Live" in mode else "webrtc"
         s["show_landmarks"] = st.toggle("Show landmarks", value=True)
         st.markdown("<hr>", unsafe_allow_html=True)
 
         with st.expander("Detection Thresholds"):
-            s["ear_threshold"] = st.slider("EAR closed", .15, .40,
-                                            cfg.ear.threshold, .01)
-            s["mar_threshold"] = st.slider("MAR yawn", .40, .80,
-                                            cfg.mar.threshold, .01)
-            s["pitch_threshold"] = st.slider("Pitch deg", 5., 40.,
+            s["ear_threshold"]   = st.slider("EAR (eye closed)", .15, .40,
+                                              cfg.ear.threshold, .01)
+            s["mar_threshold"]   = st.slider("MAR (yawn)",       .40, .80,
+                                              cfg.mar.threshold, .01)
+            s["pitch_threshold"] = st.slider("Pitch (nod) deg",  5.,  40.,
                                               cfg.head_pose.pitch_threshold, 1.)
-            s["yaw_threshold"] = st.slider("Yaw deg", 10., 50.,
-                                            cfg.head_pose.yaw_threshold, 1.)
+            s["yaw_threshold"]   = st.slider("Yaw (turn) deg",   10., 50.,
+                                              cfg.head_pose.yaw_threshold, 1.)
 
         st.markdown("<hr>", unsafe_allow_html=True)
         st.markdown("**Alarm**")
         s["alarm_enabled"] = st.toggle("Enable alarm", value=True)
-        s["alarm_volume"] = st.slider("Volume", 0., 1., .75, .05)
+        s["alarm_volume"]  = st.slider("Volume", 0., 1., .75, .05)
 
         uploaded = st.file_uploader("Custom alarm (mp3/wav/ogg)",
                                      type=["mp3", "wav", "ogg"])
         if uploaded:
             mime = ("audio/mpeg" if uploaded.name.endswith(".mp3")
-                    else "audio/ogg" if uploaded.name.endswith(".ogg")
+                    else "audio/ogg"  if uploaded.name.endswith(".ogg")
                     else "audio/wav")
             st.session_state.audio.load_from_bytes(uploaded.read(), mime)
             st.success("Custom alarm loaded")
@@ -338,52 +366,87 @@ def render_sidebar(cfg: AppConfig) -> dict:
 
         if st.button("Reset Session", use_container_width=True):
             for k in ("metrics", "score_history", "ear_history",
-                       "time_history", "status_log", "last_result"):
+                       "time_history", "status_log", "last_result",
+                       "processor"):
                 st.session_state.pop(k, None)
             st.rerun()
 
         st.markdown("<hr>", unsafe_allow_html=True)
-        st.caption("DrowseSafe AI v1.0 | MediaPipe Face Mesh | EAR+MAR+Pose")
+        st.caption("DrowseSafe AI v1.0 | MediaPipe Face Mesh")
     return s
 
 
-def render_snapshot_mode(cfg: AppConfig):
-    st.markdown(section_header_html("Live Camera Feed", "Camera"),
+# ---------------------------------------------------------------------------
+# Decode a base64 JPEG → BGR numpy array
+# ---------------------------------------------------------------------------
+def _decode_frame(data_url: str) -> Optional[np.ndarray]:
+    try:
+        if "," in data_url:
+            _, b64 = data_url.split(",", 1)
+        else:
+            b64 = data_url
+        img_bytes = base64.b64decode(b64)
+        pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+    except Exception as e:
+        logger.warning(f"Frame decode error: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Live camera mode (custom component — no click needed)
+# ---------------------------------------------------------------------------
+def render_live_mode(cfg: AppConfig):
+    """
+    Shows the custom live camera component above,
+    and the MediaPipe-annotated result below.
+    """
+    st.markdown(section_header_html("Live Camera", "Camera"),
                 unsafe_allow_html=True)
 
+    # Ensure processor exists
     if st.session_state.processor is None:
         st.session_state.processor = FrameProcessor(cfg)
     proc: FrameProcessor = st.session_state.processor
 
-    proc.eye.ear_threshold = cfg.ear.threshold
-    proc.yawn.mar_threshold = cfg.mar.threshold
-    proc.pose.pitch_threshold = cfg.head_pose.pitch_threshold
-    proc.pose.yaw_threshold = cfg.head_pose.yaw_threshold
-    proc.clf.ear_cfg = cfg.ear
-    proc.clf.mar_cfg = cfg.mar
-    proc.clf.pose_cfg = cfg.head_pose
-    proc.clf.cfg = cfg.drowsiness
-    proc.cfg = cfg
+    # Sync threshold changes
+    proc.eye.ear_threshold           = cfg.ear.threshold
+    proc.yawn.mar_threshold          = cfg.mar.threshold
+    proc.pose.pitch_threshold        = cfg.head_pose.pitch_threshold
+    proc.pose.yaw_threshold          = cfg.head_pose.yaw_threshold
+    proc.clf.ear_cfg                 = cfg.ear
+    proc.clf.mar_cfg                 = cfg.mar
+    proc.clf.pose_cfg                = cfg.head_pose
+    proc.clf.cfg                     = cfg.drowsiness
+    proc.cfg                         = cfg
 
-    count = st.session_state.snap_frame_count
-    img_file = st.camera_input(
-        "Camera",
-        key=f"snap_{count % 5}",
-        label_visibility="collapsed",
-    )
+    # ── Live camera component ──
+    frame_data = live_camera_input(height=400, key="cam")
 
-    if img_file is not None:
-        pil = Image.open(img_file).convert("RGB")
-        bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-        annotated, data = proc.process(bgr)
-        st.session_state.result_slot.put(data)
-        rgb_out = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-        st.image(rgb_out, channels="RGB", use_column_width=True)
-        st.session_state.snap_frame_count += 1
+    # ── Process latest frame ──
+    if frame_data is not None and frame_data != st.session_state.get("last_frame_b64"):
+        st.session_state.last_frame_b64 = frame_data
+        bgr = _decode_frame(frame_data)
+        if bgr is not None:
+            annotated, data = proc.process(bgr)
+            st.session_state.result_slot.put(data)
+
+            # Show annotated output
+            rgb_out = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+            st.image(rgb_out, channels="RGB", use_column_width=True,
+                     caption="Annotated Detection Output")
+        else:
+            st.warning("Could not decode frame — retrying...")
     else:
-        st.info("Allow camera access — your annotated feed will appear here.")
+        # Show last annotated if we have one
+        r = st.session_state.last_result
+        if r is None:
+            st.info("Camera loading — allow camera access in your browser if prompted.")
 
 
+# ---------------------------------------------------------------------------
+# WebRTC mode
+# ---------------------------------------------------------------------------
 def render_webrtc_mode(cfg: AppConfig):
     st.markdown(section_header_html("Live Camera Feed", "Camera"),
                 unsafe_allow_html=True)
@@ -396,6 +459,7 @@ def render_webrtc_mode(cfg: AppConfig):
             "iceServers": [
                 {"urls": ["stun:stun.l.google.com:19302"]},
                 {"urls": ["stun:stun1.l.google.com:19302"]},
+                {"urls": ["stun:stun2.l.google.com:19302"]},
             ]
         },
         video_processor_factory=lambda: DrowsinessVideoProcessor(cfg, slot),
@@ -410,17 +474,22 @@ def render_webrtc_mode(cfg: AppConfig):
     if ctx.state.playing:
         st.markdown(
             "<div style='font-size:.72rem;color:#32CD32;margin-top:6px'>"
-            "Camera active</div>", unsafe_allow_html=True)
+            "Camera active — annotated feed shown in video above</div>",
+            unsafe_allow_html=True)
     else:
         st.info("Click START to begin monitoring.")
-        st.caption("If camera does not connect, switch to Snapshot mode in the sidebar.")
+        st.caption("WebRTC requires a local or open network. "
+                   "Use Live Camera mode on Streamlit Cloud.")
 
 
+# ---------------------------------------------------------------------------
+# Status panel
+# ---------------------------------------------------------------------------
 def render_status():
     st.markdown(section_header_html("Driver Status", "Status"),
                 unsafe_allow_html=True)
-    r = st.session_state.last_result or {}
-    status = r.get("status", "No Face")
+    r      = st.session_state.last_result or {}
+    status = r.get("status", "Waiting...")
     conf   = r.get("confidence", 0.0)
     score  = r.get("score", 0.0)
     color  = r.get("color_hex", "#888888")
@@ -438,10 +507,10 @@ def render_status():
 
     if status == "Drowsy":
         st.markdown(
-            "<div class='alert-banner'>DROWSINESS DETECTED - Pull over safely!</div>",
+            "<div class='alert-banner'>DROWSINESS DETECTED — Pull over safely!</div>",
             unsafe_allow_html=True)
 
-    alarm_on = status == "Drowsy" and st.session_state.alarm_enabled
+    alarm_on = (status == "Drowsy") and st.session_state.alarm_enabled
     st.session_state.audio.render_alarm_component(
         alarm_on, st.session_state.alarm_volume)
 
@@ -456,17 +525,23 @@ def render_status():
             st.markdown(
                 f"<div style='display:flex;align-items:center;gap:8px;margin:3px 0'>"
                 f"<span style='font-size:.68rem;color:#7070a0;width:74px'>{name}</span>"
-                f"<div style='flex:1;background:rgba(255,255,255,.05);border-radius:100px;"
-                f"height:5px;overflow:hidden'><div style='height:100%;width:{pct:.0f}%;"
-                f"background:linear-gradient(90deg,#667eea,#764ba2);border-radius:100px'>"
-                f"</div></div><span style='font-size:.68rem;color:#9090b0;width:32px;"
+                f"<div style='flex:1;background:rgba(255,255,255,.05);"
+                f"border-radius:100px;height:5px;overflow:hidden'>"
+                f"<div style='height:100%;width:{pct:.0f}%;"
+                f"background:linear-gradient(90deg,#667eea,#764ba2);"
+                f"border-radius:100px'></div></div>"
+                f"<span style='font-size:.68rem;color:#9090b0;width:32px;"
                 f"text-align:right'>{val:.2f}</span></div>",
                 unsafe_allow_html=True)
 
 
+# ---------------------------------------------------------------------------
+# Metric panels
+# ---------------------------------------------------------------------------
 def render_eye():
-    st.markdown(section_header_html("Eye Metrics", "Eye"), unsafe_allow_html=True)
-    r = st.session_state.last_result or {}
+    st.markdown(section_header_html("Eye Metrics", "Eye"),
+                unsafe_allow_html=True)
+    r   = st.session_state.last_result or {}
     ear = r.get("ear", 0.)
     thr = st.session_state.cfg.ear.threshold
     st.markdown(
@@ -476,15 +551,16 @@ def render_eye():
     c1, c2 = st.columns(2)
     with c1:
         st.metric("Blinks", str(r.get("blink_count", 0)))
-        st.metric("Eye", "Closed" if r.get("is_closed") else "Open")
+        st.metric("Eye State", "Closed" if r.get("is_closed") else "Open")
     with c2:
         st.metric("Blink Rate", f"{r.get('blink_rate', 0.):.0f} bpm")
         st.metric("Closure", f"{r.get('closure_secs', 0.):.1f}s")
 
 
 def render_yawn():
-    st.markdown(section_header_html("Yawn Detection", "Yawn"), unsafe_allow_html=True)
-    r = st.session_state.last_result or {}
+    st.markdown(section_header_html("Yawn Detection", "Yawn"),
+                unsafe_allow_html=True)
+    r   = st.session_state.last_result or {}
     mar = r.get("mar", 0.)
     thr = st.session_state.cfg.mar.threshold
     st.markdown(
@@ -499,15 +575,16 @@ def render_yawn():
 
 
 def render_pose():
-    st.markdown(section_header_html("Head Pose", "Pose"), unsafe_allow_html=True)
-    r = st.session_state.last_result or {}
-    p = r.get("pitch", 0.)
-    y = r.get("yaw", 0.)
-    ro = r.get("roll", 0.)
+    st.markdown(section_header_html("Head Pose", "Pose"),
+                unsafe_allow_html=True)
+    r    = st.session_state.last_result or {}
+    p    = r.get("pitch", 0.)
+    y    = r.get("yaw",   0.)
+    ro   = r.get("roll",  0.)
     pthr = st.session_state.cfg.head_pose.pitch_threshold
     ythr = st.session_state.cfg.head_pose.yaw_threshold
-    pc = "#DC143C" if abs(p) > pthr else "#32CD32"
-    yc = "#FFA500" if abs(y) > ythr else "#32CD32"
+    pc   = "#DC143C" if abs(p) > pthr else "#32CD32"
+    yc   = "#FFA500" if abs(y) > ythr else "#32CD32"
     c1, c2 = st.columns(2)
     with c1:
         for lbl, val, col in [("PITCH", p, pc), ("YAW", y, yc)]:
@@ -531,13 +608,13 @@ def render_pose():
 def render_system():
     st.markdown(section_header_html("System Performance", "Perf"),
                 unsafe_allow_html=True)
-    r = st.session_state.last_result or {}
+    r   = st.session_state.last_result or {}
     fps = r.get("fps", 0.)
     rep = st.session_state.metrics.session_report()
-    fc = "#32CD32" if fps >= 15 else "#FFA500" if fps >= 8 else "#DC143C"
+    fc  = "#32CD32" if fps >= 10 else "#FFA500" if fps >= 5 else "#DC143C"
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.markdown(metric_card_html("Live FPS", f"{fps:.0f}", "target 15", fc),
+        st.markdown(metric_card_html("Live FPS", f"{fps:.0f}", "target 10", fc),
                     unsafe_allow_html=True)
     with c2:
         st.markdown(metric_card_html("Frames", str(rep["total_frames"])),
@@ -551,6 +628,9 @@ def render_system():
                     unsafe_allow_html=True)
 
 
+# ---------------------------------------------------------------------------
+# History updater
+# ---------------------------------------------------------------------------
 def update_history():
     slot: _ResultSlot = st.session_state.result_slot
     data = slot.get()
@@ -563,11 +643,11 @@ def update_history():
 
     start = st.session_state.session_start
     rel_t = data.get("ts", time.time()) - start
-    MAX = 400
-    for key, val in [("time_history", rel_t),
+    MAX   = 400
+    for key, val in [("time_history",  rel_t),
                       ("score_history", data.get("score", 0.)),
-                      ("ear_history", data.get("ear", 0.)),
-                      ("status_log", data.get("status", "No Face"))]:
+                      ("ear_history",   data.get("ear",   0.)),
+                      ("status_log",    data.get("status", "No Face"))]:
         lst = st.session_state[key]
         lst.append(val)
         if len(lst) > MAX:
@@ -575,9 +655,9 @@ def update_history():
 
     m: MetricsTracker = st.session_state.metrics
     m.update(
-        ear=data.get("ear", 0.), mar=data.get("mar", 0.),
+        ear=data.get("ear",   0.), mar=data.get("mar", 0.),
         pitch=data.get("pitch", 0.), yaw=data.get("yaw", 0.),
-        roll=data.get("roll", 0.), drowsiness_score=data.get("score", 0.),
+        roll=data.get("roll",  0.), drowsiness_score=data.get("score", 0.),
         status=data.get("status", "No Face"),
         confidence=data.get("confidence", 0.),
         fps=data.get("fps", 0.), face_detected=data.get("face_detected", False),
@@ -585,28 +665,31 @@ def update_history():
     )
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
     inject_css()
     cfg = get_config()
     init_state(cfg)
 
+    # Apply sidebar settings
     settings = render_sidebar(cfg)
-    cfg.show_landmarks = settings.get("show_landmarks", True)
-    cfg.ear.threshold = settings.get("ear_threshold", cfg.ear.threshold)
-    cfg.mar.threshold = settings.get("mar_threshold", cfg.mar.threshold)
-    cfg.head_pose.pitch_threshold = settings.get("pitch_threshold",
-                                                  cfg.head_pose.pitch_threshold)
-    cfg.head_pose.yaw_threshold = settings.get("yaw_threshold",
-                                                cfg.head_pose.yaw_threshold)
-    st.session_state.cfg = cfg
-    st.session_state.alarm_enabled = settings.get("alarm_enabled", True)
-    st.session_state.alarm_volume = settings.get("alarm_volume", .75)
-    mode = settings.get("capture_mode", "snapshot")
-    st.session_state.capture_mode = mode
+    cfg.show_landmarks               = settings.get("show_landmarks", True)
+    cfg.ear.threshold                = settings.get("ear_threshold",    cfg.ear.threshold)
+    cfg.mar.threshold                = settings.get("mar_threshold",    cfg.mar.threshold)
+    cfg.head_pose.pitch_threshold    = settings.get("pitch_threshold",  cfg.head_pose.pitch_threshold)
+    cfg.head_pose.yaw_threshold      = settings.get("yaw_threshold",    cfg.head_pose.yaw_threshold)
+    st.session_state.cfg             = cfg
+    st.session_state.alarm_enabled   = settings.get("alarm_enabled", True)
+    st.session_state.alarm_volume    = settings.get("alarm_volume",  .75)
+    mode = settings.get("capture_mode", "live")
 
-    st_autorefresh(interval=300, limit=None, key="main_refresh")
+    # Auto-refresh for metrics updates between frames
+    st_autorefresh(interval=500, limit=None, key="main_refresh")
     update_history()
 
+    # Header
     st.markdown("""
 <div class="ddd-header">
   <span style="font-size:2.2rem">&#x1F697;</span>
@@ -614,34 +697,34 @@ def main():
     <div class="ddd-header-title">AI Driver Drowsiness Detection</div>
     <div class="ddd-header-subtitle">
       Real-time Eye &middot; Yawn &middot; Head-Pose Analysis
-      &nbsp;&middot;&nbsp; MediaPipe Face Mesh &nbsp;&middot;&nbsp; Production Ready
+      &nbsp;&middot;&nbsp; MediaPipe Face Mesh
     </div>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
+    # Main layout: video (left) + status (right)
     col_vid, col_status = st.columns([3, 2], gap="large")
     with col_vid:
-        if mode == "snapshot":
-            render_snapshot_mode(cfg)
+        if mode == "live":
+            render_live_mode(cfg)
         else:
             render_webrtc_mode(cfg)
     with col_status:
         render_status()
 
+    # Metric row
     st.markdown("---")
     c1, c2, c3 = st.columns(3, gap="medium")
-    with c1:
-        render_eye()
-    with c2:
-        render_yawn()
-    with c3:
-        render_pose()
+    with c1: render_eye()
+    with c2: render_yawn()
+    with c3: render_pose()
 
+    # Charts
     st.markdown("---")
-    t_vals = st.session_state.time_history
-    s_vals = st.session_state.score_history
-    e_vals = st.session_state.ear_history
+    t_vals  = st.session_state.time_history
+    s_vals  = st.session_state.score_history
+    e_vals  = st.session_state.ear_history
     st_vals = st.session_state.status_log
 
     tab_sc, tab_ear, tab_dist, tab_log = st.tabs([
@@ -673,11 +756,9 @@ def main():
                             config={"displayModeBar": False})
         with d2:
             st.markdown("<br>", unsafe_allow_html=True)
-            for lbl, key, col in [
-                ("Alert", "alert_pct", "#32CD32"),
-                ("Slightly Drowsy", "slight_pct", "#FFA500"),
-                ("Drowsy", "drowsy_pct", "#DC143C"),
-            ]:
+            for lbl, key, col in [("Alert",          "alert_pct",  "#32CD32"),
+                                    ("Slightly Drowsy", "slight_pct", "#FFA500"),
+                                    ("Drowsy",          "drowsy_pct", "#DC143C")]:
                 st.markdown(
                     f"<div style='display:flex;justify-content:space-between;"
                     f"margin:4px 0'><span style='font-size:.8rem;color:{col}'>"
@@ -686,15 +767,15 @@ def main():
                     unsafe_allow_html=True)
             st.markdown("<br>", unsafe_allow_html=True)
             st.metric("Blink Rate", f"{rep['blink_rate_bpm']} bpm")
-            st.metric("Yawns", str(rep["total_yawns"]))
+            st.metric("Yawns",      str(rep["total_yawns"]))
             st.metric("Peak Score", f"{rep['peak_score']:.3f}")
     with tab_log:
         if st_vals:
             df = pd.DataFrame({
                 "Time (s)": [f"{v:.1f}" for v in t_vals[-100:]],
-                "Score": [f"{v:.3f}" for v in s_vals[-100:]],
-                "EAR": [f"{v:.3f}" for v in e_vals[-100:]],
-                "Status": st_vals[-100:],
+                "Score":    [f"{v:.3f}" for v in s_vals[-100:]],
+                "EAR":      [f"{v:.3f}" for v in e_vals[-100:]],
+                "Status":   st_vals[-100:],
             })
             st.dataframe(df[::-1], use_container_width=True, height=260)
             st.download_button(
