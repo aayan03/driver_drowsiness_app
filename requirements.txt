@@ -1,6 +1,7 @@
 streamlit>=1.32.0
 streamlit-webrtc>=0.47.2
 streamlit-autorefresh>=0.0.1
+tornado>=6.0.3,<6.4
 av==12.3.0
 aiortc>=1.9.0
 opencv-python-headless==4.9.0.80
