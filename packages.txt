@@ -1,0 +1,9 @@
+# System-level packages for Streamlit Cloud (Ubuntu)
+# These are pre-installed on most systems; included for cloud deployment.
+
+libgl1-mesa-glx
+libglib2.0-0
+libsm6
+libxext6
+libxrender-dev
+libgomp1

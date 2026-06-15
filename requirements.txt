@@ -1,0 +1,44 @@
+# ─────────────────────────────────────────────────────────────
+# AI Driver Drowsiness Detection System — Python dependencies
+# Install with: pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────
+
+# Core framework
+streamlit>=1.32.0
+
+# Real-time WebRTC video in Streamlit
+streamlit-webrtc>=0.47.2
+
+# UI auto-refresh for near-real-time metric updates
+streamlit-autorefresh>=0.0.1
+
+# Video frame processing (used by streamlit-webrtc)
+av>=10.0.0
+
+# WebRTC transport layer (required by streamlit-webrtc)
+aiortc>=1.6.0
+
+# Computer vision
+opencv-python-headless>=4.9.0.80
+
+# Face landmark detection (no GPU required)
+mediapipe>=0.10.9
+
+# Numerical computing
+numpy>=1.26.0
+
+# Data analysis + export
+pandas>=2.1.0
+
+# Interactive charts
+plotly>=5.18.0
+
+# Image utilities (screenshot saving)
+Pillow>=10.2.0
+
+# Audio synthesis (default alarm generation)
+# Note: only stdlib (wave, struct, math) is used — no additional audio lib needed.
+# pydub is optional for advanced audio format conversion:
+# pydub>=0.25.1
+
+# Type checking utilities (stdlib only, no extra install)
